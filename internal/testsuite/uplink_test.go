@@ -12,22 +12,28 @@ import (
 	"github.com/brocaar/loraserver/api/gw"
 	"github.com/brocaar/loraserver/api/nc"
 	"github.com/brocaar/loraserver/internal/common"
-	"github.com/brocaar/loraserver/internal/queue"
+	"github.com/brocaar/loraserver/internal/maccommand"
 	"github.com/brocaar/loraserver/internal/session"
 	"github.com/brocaar/loraserver/internal/test"
 	"github.com/brocaar/loraserver/internal/uplink"
 	"github.com/brocaar/lorawan"
 )
 
+type macCommandPending struct {
+	CID      lorawan.CID
+	Payloads []lorawan.MACCommandPayload
+}
+
 type uplinkTestCase struct {
-	Name                 string              // name of the test
-	NodeSession          session.NodeSession // node-session
-	SetMICKey            lorawan.AES128Key   // key to use for setting the mic
-	EncryptFRMPayloadKey *lorawan.AES128Key  // key to use for encrypting the uplink FRMPayload (e.g. for mac-commands in FRMPayload)
-	DecryptFRMPayloadKey *lorawan.AES128Key  // key for decrypting the downlink FRMPayload (e.g. to validate FRMPayload mac-commands)
-	RXInfo               gw.RXInfo           // rx-info of the "received" packet
-	PHYPayload           lorawan.PHYPayload  // (unencrypted) "received" PHYPayload
-	TXMACPayloadQueue    []queue.MACPayload  // downlink mac-command queue
+	Name                 string                 // name of the test
+	NodeSession          session.NodeSession    // node-session
+	SetMICKey            lorawan.AES128Key      // key to use for setting the mic
+	EncryptFRMPayloadKey *lorawan.AES128Key     // key to use for encrypting the uplink FRMPayload (e.g. for mac-commands in FRMPayload)
+	DecryptFRMPayloadKey *lorawan.AES128Key     // key for decrypting the downlink FRMPayload (e.g. to validate FRMPayload mac-commands)
+	RXInfo               gw.RXInfo              // rx-info of the "received" packet
+	PHYPayload           lorawan.PHYPayload     // (unencrypted) "received" PHYPayload
+	MACCommandQueue      []maccommand.QueueItem // downlink mac-command queue
+	MACCommandPending    []macCommandPending    // pending mac-commands
 
 	ApplicationGetDataDown       as.GetDataDownResponse // application-server get data down response
 	ApplicationHandleDataUpError error                  // application-client publish data-up error
@@ -42,12 +48,24 @@ type uplinkTestCase struct {
 	ExpectedApplicationHandleDataDownACK *as.HandleDataDownACKRequest // expected application-server datadown ack request
 	ExpectedApplicationGetDataDown       *as.GetDataDownRequest       // expected application-server get data down request
 
-	ExpectedTXInfo              *gw.TXInfo          // expected tx-info (downlink)
-	ExpectedPHYPayload          *lorawan.PHYPayload // expected (plaintext) PHYPayload (downlink)
-	ExpectedFCntUp              uint32              // expected uplink frame counter
-	ExpectedFCntDown            uint32              // expected downlink frame counter
-	ExpectedHandleRXPacketError error               // expected handleRXPacket error
-	ExpectedTXMACPayloadQueue   []queue.MACPayload  // expected downlink mac-command queue
+	ExpectedTXInfo              *gw.TXInfo             // expected tx-info (downlink)
+	ExpectedPHYPayload          *lorawan.PHYPayload    // expected (plaintext) PHYPayload (downlink)
+	ExpectedFCntUp              uint32                 // expected uplink frame counter
+	ExpectedFCntDown            uint32                 // expected downlink frame counter
+	ExpectedHandleRXPacketError error                  // expected handleRXPacket error
+	ExpectedMACCommandQueue     []maccommand.QueueItem // expected downlink mac-command queue
+	ExpectedTXPower             int                    // expected tx-power set by ADR
+	ExpectedNbTrans             uint8                  // expected nb trans set by ADR
+}
+
+func init() {
+	if err := lorawan.RegisterProprietaryMACCommand(true, 0x80, 3); err != nil {
+		panic(err)
+	}
+
+	if err := lorawan.RegisterProprietaryMACCommand(true, 0x81, 2); err != nil {
+		panic(err)
+	}
 }
 
 func TestUplinkScenarios(t *testing.T) {
@@ -68,6 +86,7 @@ func TestUplinkScenarios(t *testing.T) {
 		rxInfo := gw.RXInfo{
 			Frequency: common.Band.UplinkChannels[0].Frequency,
 			DataRate:  common.Band.DataRates[common.Band.UplinkChannels[0].DataRates[0]],
+			LoRaSNR:   7,
 		}
 
 		ns := session.NodeSession{
@@ -130,6 +149,17 @@ func TestUplinkScenarios(t *testing.T) {
 			RXDelay:  5,
 		}
 
+		nsADREnabled := session.NodeSession{
+			DevAddr:            [4]byte{1, 2, 3, 4},
+			DevEUI:             [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+			NwkSKey:            [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+			FCntUp:             10,
+			FCntDown:           5,
+			AppEUI:             [8]byte{8, 7, 6, 5, 4, 3, 2, 1},
+			ADRInterval:        10,
+			InstallationMargin: 5,
+		}
+
 		var fPortZero uint8
 		var fPortOne uint8 = 1
 
@@ -137,6 +167,29 @@ func TestUplinkScenarios(t *testing.T) {
 			AppEUI: ns.AppEUI[:],
 			DevEUI: ns.DevEUI[:],
 			TxInfo: &nc.TXInfo{
+				Frequency: int64(rxInfo.Frequency),
+				DataRate: &nc.DataRate{
+					Modulation:   string(rxInfo.DataRate.Modulation),
+					BandWidth:    uint32(rxInfo.DataRate.Bandwidth),
+					SpreadFactor: uint32(rxInfo.DataRate.SpreadFactor),
+					Bitrate:      uint32(rxInfo.DataRate.BitRate),
+				},
+			},
+			RxInfo: []*nc.RXInfo{
+				{
+					Mac:     rxInfo.MAC[:],
+					Time:    rxInfo.Time.Format(time.RFC3339Nano),
+					Rssi:    int32(rxInfo.RSSI),
+					LoRaSNR: rxInfo.LoRaSNR,
+				},
+			},
+		}
+
+		expectedControllerHandleRXInfoADR := &nc.HandleRXInfoRequest{
+			AppEUI: ns.AppEUI[:],
+			DevEUI: ns.DevEUI[:],
+			TxInfo: &nc.TXInfo{
+				Adr:       true,
 				Frequency: int64(rxInfo.Frequency),
 				DataRate: &nc.DataRate{
 					Modulation:   string(rxInfo.DataRate.Modulation),
@@ -241,6 +294,7 @@ func TestUplinkScenarios(t *testing.T) {
 			tests := []uplinkTestCase{
 				{
 					Name:                         "the application backend returns an error",
+					ExpectedPHYPayload:           &lorawan.PHYPayload{},
 					NodeSession:                  ns,
 					RXInfo:                       rxInfo,
 					SetMICKey:                    ns.NwkSKey,
@@ -719,8 +773,8 @@ func TestUplinkScenarios(t *testing.T) {
 								DevAddr: ns.DevAddr,
 								FCnt:    10,
 								FOpts: []lorawan.MACCommand{
-									{CID: lorawan.LinkCheckReq},
-									{CID: lorawan.LinkADRAns, Payload: &lorawan.LinkADRAnsPayload{ChannelMaskACK: true}},
+									{CID: 0x80, Payload: &lorawan.ProprietaryMACCommandPayload{Bytes: []byte{1, 2, 3}}},
+									{CID: 0x81, Payload: &lorawan.ProprietaryMACCommandPayload{Bytes: []byte{4, 5}}},
 								},
 							},
 						},
@@ -728,8 +782,8 @@ func TestUplinkScenarios(t *testing.T) {
 					ExpectedApplicationGetDataDown: expectedGetDataDown,
 					ExpectedControllerHandleRXInfo: expectedControllerHandleRXInfo,
 					ExpectedControllerHandleDataUpMACCommands: []nc.HandleDataUpMACCommandRequest{
-						{AppEUI: ns.AppEUI[:], DevEUI: ns.DevEUI[:], Data: []byte{2}},
-						{AppEUI: ns.AppEUI[:], DevEUI: ns.DevEUI[:], Data: []byte{3, 1}},
+						{AppEUI: ns.AppEUI[:], DevEUI: ns.DevEUI[:], Data: []byte{128, 1, 2, 3}},
+						{AppEUI: ns.AppEUI[:], DevEUI: ns.DevEUI[:], Data: []byte{129, 4, 5}},
 					},
 					ExpectedFCntUp:   11,
 					ExpectedFCntDown: 5,
@@ -752,16 +806,16 @@ func TestUplinkScenarios(t *testing.T) {
 							},
 							FPort: &fPortZero,
 							FRMPayload: []lorawan.Payload{
-								&lorawan.MACCommand{CID: lorawan.LinkCheckReq},
-								&lorawan.MACCommand{CID: lorawan.LinkADRAns, Payload: &lorawan.LinkADRAnsPayload{ChannelMaskACK: true}},
+								&lorawan.MACCommand{CID: 0x80, Payload: &lorawan.ProprietaryMACCommandPayload{Bytes: []byte{1, 2, 3}}},
+								&lorawan.MACCommand{CID: 0x81, Payload: &lorawan.ProprietaryMACCommandPayload{Bytes: []byte{4, 5}}},
 							},
 						},
 					},
 					ExpectedApplicationGetDataDown: expectedGetDataDown,
 					ExpectedControllerHandleRXInfo: expectedControllerHandleRXInfo,
 					ExpectedControllerHandleDataUpMACCommands: []nc.HandleDataUpMACCommandRequest{
-						{AppEUI: ns.AppEUI[:], DevEUI: ns.DevEUI[:], FrmPayload: true, Data: []byte{2}},
-						{AppEUI: ns.AppEUI[:], DevEUI: ns.DevEUI[:], FrmPayload: true, Data: []byte{3, 1}},
+						{AppEUI: ns.AppEUI[:], DevEUI: ns.DevEUI[:], FrmPayload: true, Data: []byte{128, 1, 2, 3}},
+						{AppEUI: ns.AppEUI[:], DevEUI: ns.DevEUI[:], FrmPayload: true, Data: []byte{129, 4, 5}},
 					},
 					ExpectedFCntUp:   11,
 					ExpectedFCntDown: 5,
@@ -805,7 +859,7 @@ func TestUplinkScenarios(t *testing.T) {
 					NodeSession: ns,
 					RXInfo:      rxInfo,
 					SetMICKey:   ns.NwkSKey,
-					TXMACPayloadQueue: []queue.MACPayload{
+					MACCommandQueue: []maccommand.QueueItem{
 						{DevEUI: ns.DevEUI, Data: []byte{6}},
 						{DevEUI: ns.DevEUI, Data: []byte{8, 3}},
 					},
@@ -860,7 +914,7 @@ func TestUplinkScenarios(t *testing.T) {
 						FPort: 3,
 						Data:  []byte{4, 5, 6},
 					},
-					TXMACPayloadQueue: []queue.MACPayload{
+					MACCommandQueue: []maccommand.QueueItem{
 						{DevEUI: ns.DevEUI, Data: []byte{6}},
 						{DevEUI: ns.DevEUI, Data: []byte{8, 3}},
 					},
@@ -916,7 +970,7 @@ func TestUplinkScenarios(t *testing.T) {
 					RXInfo:               rxInfo,
 					SetMICKey:            ns.NwkSKey,
 					DecryptFRMPayloadKey: &ns.NwkSKey,
-					TXMACPayloadQueue: []queue.MACPayload{
+					MACCommandQueue: []maccommand.QueueItem{
 						{DevEUI: ns.DevEUI, FRMPayload: true, Data: []byte{6}},
 						{DevEUI: ns.DevEUI, FRMPayload: true, Data: []byte{8, 3}},
 					},
@@ -972,7 +1026,7 @@ func TestUplinkScenarios(t *testing.T) {
 						FPort: 3,
 						Data:  []byte{4, 5, 6},
 					},
-					TXMACPayloadQueue: []queue.MACPayload{
+					MACCommandQueue: []maccommand.QueueItem{
 						{DevEUI: ns.DevEUI, FRMPayload: true, Data: []byte{6}},
 						{DevEUI: ns.DevEUI, FRMPayload: true, Data: []byte{8, 3}},
 					},
@@ -1018,7 +1072,7 @@ func TestUplinkScenarios(t *testing.T) {
 							},
 						},
 					},
-					ExpectedTXMACPayloadQueue: []queue.MACPayload{
+					ExpectedMACCommandQueue: []maccommand.QueueItem{
 						{DevEUI: ns.DevEUI, FRMPayload: true, Data: []byte{6}},
 						{DevEUI: ns.DevEUI, FRMPayload: true, Data: []byte{8, 3}},
 					},
@@ -1031,7 +1085,7 @@ func TestUplinkScenarios(t *testing.T) {
 					RXInfo:               rxInfo,
 					SetMICKey:            ns.NwkSKey,
 					DecryptFRMPayloadKey: &ns.NwkSKey,
-					TXMACPayloadQueue: []queue.MACPayload{
+					MACCommandQueue: []maccommand.QueueItem{
 						{DevEUI: ns.DevEUI, Data: []byte{2, 10, 3}},
 						{DevEUI: ns.DevEUI, Data: []byte{6}},
 						{DevEUI: ns.DevEUI, Data: []byte{4, 15}},
@@ -1093,7 +1147,7 @@ func TestUplinkScenarios(t *testing.T) {
 						},
 					},
 
-					ExpectedTXMACPayloadQueue: []queue.MACPayload{
+					ExpectedMACCommandQueue: []maccommand.QueueItem{
 						{DevEUI: ns.DevEUI, Data: []byte{2, 10, 6}},
 					},
 					ExpectedFCntUp:   11,
@@ -1300,7 +1354,7 @@ func TestUplinkScenarios(t *testing.T) {
 						FPort: 10,
 						Data:  make([]byte, 51),
 					},
-					TXMACPayloadQueue: []queue.MACPayload{
+					MACCommandQueue: []maccommand.QueueItem{
 						{DevEUI: ns.DevEUI, Data: []byte{6}},
 					},
 					PHYPayload: lorawan.PHYPayload{
@@ -1347,8 +1401,230 @@ func TestUplinkScenarios(t *testing.T) {
 					ExpectedFCntUp:                 11,
 					ExpectedFCntDown:               6,
 					ExpectedApplicationGetDataDown: expectedGetDataDown,
-					ExpectedTXMACPayloadQueue: []queue.MACPayload{
+					ExpectedMACCommandQueue: []maccommand.QueueItem{
 						{DevEUI: ns.DevEUI, Data: []byte{6}},
+					},
+				},
+			}
+
+			runUplinkTests(ctx, tests)
+		})
+
+		Convey("Given a set of test-scenarios for ADR", func() {
+			tests := []uplinkTestCase{
+				{
+					Name:        "adr triggered because of adr interval",
+					NodeSession: nsADREnabled,
+					RXInfo:      rxInfo,
+					SetMICKey:   ns.NwkSKey,
+					PHYPayload: lorawan.PHYPayload{
+						MHDR: lorawan.MHDR{
+							MType: lorawan.UnconfirmedDataUp,
+							Major: lorawan.LoRaWANR1,
+						},
+						MACPayload: &lorawan.MACPayload{
+							FHDR: lorawan.FHDR{
+								DevAddr: ns.DevAddr,
+								FCnt:    10,
+								FCtrl: lorawan.FCtrl{
+									ADR: true,
+								},
+							},
+						},
+					},
+					ExpectedControllerHandleRXInfo: expectedControllerHandleRXInfoADR,
+					ExpectedApplicationGetDataDown: expectedGetDataDown,
+					ExpectedFCntUp:                 11,
+					ExpectedFCntDown:               6,
+					ExpectedTXInfo: &gw.TXInfo{
+						Timestamp: rxInfo.Timestamp + 1000000,
+						Frequency: rxInfo.Frequency,
+						Power:     14,
+						DataRate:  rxInfo.DataRate,
+					},
+					ExpectedPHYPayload: &lorawan.PHYPayload{
+						MHDR: lorawan.MHDR{
+							MType: lorawan.UnconfirmedDataDown,
+							Major: lorawan.LoRaWANR1,
+						},
+						MACPayload: &lorawan.MACPayload{
+							FHDR: lorawan.FHDR{
+								DevAddr: ns.DevAddr,
+								FCnt:    5,
+								FCtrl: lorawan.FCtrl{
+									ADR: true,
+								},
+								FOpts: []lorawan.MACCommand{
+									{
+										CID: lorawan.LinkADRReq,
+										Payload: &lorawan.LinkADRReqPayload{
+											DataRate: 5,
+											TXPower:  3,
+											ChMask:   [16]bool{true, true, true},
+											Redundancy: lorawan.Redundancy{
+												ChMaskCntl: 0,
+												NbRep:      1,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Name:        "adr interval matches, but node does not support adr",
+					NodeSession: nsADREnabled,
+					RXInfo:      rxInfo,
+					SetMICKey:   ns.NwkSKey,
+					PHYPayload: lorawan.PHYPayload{
+						MHDR: lorawan.MHDR{
+							MType: lorawan.UnconfirmedDataUp,
+							Major: lorawan.LoRaWANR1,
+						},
+						MACPayload: &lorawan.MACPayload{
+							FHDR: lorawan.FHDR{
+								DevAddr: ns.DevAddr,
+								FCnt:    10,
+								FCtrl: lorawan.FCtrl{
+									ADR: false,
+								},
+							},
+						},
+					},
+					ExpectedControllerHandleRXInfo: expectedControllerHandleRXInfo,
+					ExpectedApplicationGetDataDown: expectedGetDataDown,
+					ExpectedFCntUp:                 11,
+					ExpectedFCntDown:               5,
+				},
+				{
+					Name:        "acknowledgement of pending adr request",
+					NodeSession: nsADREnabled,
+					RXInfo:      rxInfo,
+					SetMICKey:   ns.NwkSKey,
+					MACCommandPending: []macCommandPending{
+						{
+							CID: lorawan.LinkADRReq,
+							Payloads: []lorawan.MACCommandPayload{
+								&lorawan.LinkADRReqPayload{
+									DataRate: 5,
+									TXPower:  3,
+									ChMask:   [16]bool{true, true, true},
+									Redundancy: lorawan.Redundancy{
+										ChMaskCntl: 0,
+										NbRep:      1,
+									},
+								},
+							},
+						},
+					},
+					PHYPayload: lorawan.PHYPayload{
+						MHDR: lorawan.MHDR{
+							MType: lorawan.UnconfirmedDataUp,
+							Major: lorawan.LoRaWANR1,
+						},
+						MACPayload: &lorawan.MACPayload{
+							FHDR: lorawan.FHDR{
+								DevAddr: ns.DevAddr,
+								FCnt:    10,
+								FOpts: []lorawan.MACCommand{
+									{CID: lorawan.LinkADRAns, Payload: &lorawan.LinkADRAnsPayload{ChannelMaskACK: true, DataRateACK: true, PowerACK: true}},
+								},
+							},
+						},
+					},
+					ExpectedControllerHandleRXInfo: expectedControllerHandleRXInfo,
+					ExpectedApplicationGetDataDown: expectedGetDataDown,
+					ExpectedFCntUp:                 11,
+					ExpectedFCntDown:               5,
+					ExpectedTXPower:                8,
+					ExpectedNbTrans:                1,
+				},
+				{
+					Name:        "negative acknowledgement of pending adr request",
+					NodeSession: nsADREnabled,
+					RXInfo:      rxInfo,
+					SetMICKey:   ns.NwkSKey,
+					MACCommandPending: []macCommandPending{
+						{
+							CID: lorawan.LinkADRReq,
+							Payloads: []lorawan.MACCommandPayload{
+								&lorawan.LinkADRReqPayload{
+									DataRate: 5,
+									TXPower:  3,
+									ChMask:   [16]bool{true, true, true},
+									Redundancy: lorawan.Redundancy{
+										ChMaskCntl: 0,
+										NbRep:      1,
+									},
+								},
+							},
+						},
+					},
+					PHYPayload: lorawan.PHYPayload{
+						MHDR: lorawan.MHDR{
+							MType: lorawan.UnconfirmedDataUp,
+							Major: lorawan.LoRaWANR1,
+						},
+						MACPayload: &lorawan.MACPayload{
+							FHDR: lorawan.FHDR{
+								DevAddr: ns.DevAddr,
+								FCnt:    10,
+								FOpts: []lorawan.MACCommand{
+									{CID: lorawan.LinkADRAns, Payload: &lorawan.LinkADRAnsPayload{ChannelMaskACK: false, DataRateACK: true, PowerACK: true}},
+								},
+							},
+						},
+					},
+					ExpectedControllerHandleRXInfo: expectedControllerHandleRXInfo,
+					ExpectedApplicationGetDataDown: expectedGetDataDown,
+					ExpectedFCntUp:                 11,
+					ExpectedFCntDown:               5,
+				},
+				{
+					Name:        "adr ack requested",
+					NodeSession: nsADREnabled,
+					RXInfo:      rxInfo,
+					SetMICKey:   ns.NwkSKey,
+					PHYPayload: lorawan.PHYPayload{
+						MHDR: lorawan.MHDR{
+							MType: lorawan.UnconfirmedDataUp,
+							Major: lorawan.LoRaWANR1,
+						},
+						MACPayload: &lorawan.MACPayload{
+							FHDR: lorawan.FHDR{
+								DevAddr: ns.DevAddr,
+								FCnt:    10,
+								FCtrl: lorawan.FCtrl{
+									ADRACKReq: true,
+								},
+							},
+						},
+					},
+					ExpectedControllerHandleRXInfo: expectedControllerHandleRXInfo,
+					ExpectedApplicationGetDataDown: expectedGetDataDown,
+					ExpectedFCntUp:                 11,
+					ExpectedFCntDown:               6,
+					ExpectedTXInfo: &gw.TXInfo{
+						Timestamp: rxInfo.Timestamp + 1000000,
+						Frequency: rxInfo.Frequency,
+						Power:     14,
+						DataRate:  rxInfo.DataRate,
+					},
+					ExpectedPHYPayload: &lorawan.PHYPayload{
+						MHDR: lorawan.MHDR{
+							MType: lorawan.UnconfirmedDataDown,
+							Major: lorawan.LoRaWANR1,
+						},
+						MACPayload: &lorawan.MACPayload{
+							FHDR: lorawan.FHDR{
+								DevAddr: ns.DevAddr,
+								FCnt:    5,
+								FCtrl: lorawan.FCtrl{
+									ADR: true,
+								},
+							},
+						},
 					},
 				},
 			}
@@ -1368,8 +1644,11 @@ func runUplinkTests(ctx common.Context, tests []uplinkTestCase) {
 
 			// populate session and queues
 			So(session.CreateNodeSession(ctx.RedisPool, t.NodeSession), ShouldBeNil)
-			for _, pl := range t.TXMACPayloadQueue {
-				So(queue.AddMACPayloadToTXQueue(ctx.RedisPool, pl), ShouldBeNil)
+			for _, pl := range t.MACCommandQueue {
+				So(maccommand.AddToQueue(ctx.RedisPool, pl), ShouldBeNil)
+			}
+			for _, pending := range t.MACCommandPending {
+				So(maccommand.SetPending(ctx.RedisPool, t.NodeSession.DevEUI, pending.CID, pending.Payloads), ShouldBeNil)
 			}
 
 			// encrypt FRMPayload and set MIC
@@ -1485,12 +1764,28 @@ func runUplinkTests(ctx common.Context, tests []uplinkTestCase) {
 				So(ns.FCntUp, ShouldEqual, t.ExpectedFCntUp)
 			})
 
+			// ADR variables validations
+			Convey("Then the TXPower and NbTrans are as expected", func() {
+				ns, err := session.GetNodeSessionByDevEUI(ctx.RedisPool, t.NodeSession.DevEUI)
+				So(err, ShouldBeNil)
+				So(ns.TXPower, ShouldEqual, t.ExpectedTXPower)
+				So(ns.NbTrans, ShouldEqual, t.ExpectedNbTrans)
+			})
+
 			// queue validations
 			Convey("Then the mac-command queue is as expected", func() {
-				macQueue, err := queue.ReadMACPayloadTXQueue(ctx.RedisPool, t.NodeSession.DevAddr)
+				macQueue, err := maccommand.ReadQueue(ctx.RedisPool, t.NodeSession.DevAddr)
 				So(err, ShouldBeNil)
-				So(macQueue, ShouldResemble, t.ExpectedTXMACPayloadQueue)
+				So(macQueue, ShouldResemble, t.ExpectedMACCommandQueue)
 			})
+
+			if t.ExpectedHandleRXPacketError == nil {
+				Convey("Then the expected RSInfoSet has been added to the node-session", func() {
+					ns, err := session.GetNodeSessionByDevEUI(ctx.RedisPool, t.NodeSession.DevEUI)
+					So(err, ShouldBeNil)
+					So(ns.LastRXInfoSet, ShouldResemble, []gw.RXInfo{t.RXInfo})
+				})
+			}
 		})
 	}
 }

@@ -18,7 +18,10 @@ Todo.
 
 ### Class C
 
-Todo.
+LoRa Server has full support for Class-C devices. It will remember the last
+rx parameters (of each gateway that received the uplink), so that the
+nearest gateway can be used for the Class-C uplink. An uplink can be scheduled
+by using the `NetworkServer.PushDataDown` API method.
 
 ## Confirmed data up / down
 
@@ -34,6 +37,18 @@ provisions LoRa Server with a node-session. In case of OTAA, LoRa Server will
 call the [application server](https://docs.loraserver.io/lora-app-server/) with
 the received join-request and in case of a positive response, it will transmit
 the join-accept to the node.
+
+## Adaptive data-rate (experimental)
+
+LoRa Server has support for adaptive data-rate (ADR). In order to activate ADR,
+The node must have the ADR interval and installation margin configured. The
+first one contains the number of frames after which to re-calculate the ideal
+data-rate and TX power of the node, the latter one holds the installation margin
+of the network (the default recommended value is 5dB). From the node-side it is
+required that the ADR flag is set for each uplink transmission.
+
+**Important:** ADR is only suitable for static devices, thus devices that do
+not move! 
 
 ## Network-controller interface
 
@@ -63,13 +78,13 @@ As different regions have have different regulations regarding the license-free
 bands, you have to specify the ISM band to operate on when starting LoRa Server.
 At this moment the following ISM bands have been implemented:
 
+- AS 923
 - AU 915-928
 - CN 470-510
+- CN 779-787
+- EU 433
 - EU 863-870
+- KR 920-923
+- RU 864-869
 - US 902-928
 
-For the following ISM bands help is needed to verify the correctness of the
-implementation:
-
--  EU 433 ISM band testers ([issues/49](https://github.com/brocaar/loraserver/issues/49))
--  CN 779-787 ISM band testers ([issues/50](https://github.com/brocaar/loraserver/issues/50))

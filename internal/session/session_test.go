@@ -38,6 +38,54 @@ func TestGetRandomDevAddr(t *testing.T) {
 	})
 }
 
+func TestUplinkHistory(t *testing.T) {
+	Convey("Given an empty node-session", t, func() {
+		ns := NodeSession{}
+
+		Convey("When appending 30 items to the UplinkHistory", func() {
+			for i := uint32(0); i < 30; i++ {
+				ns.AppendUplinkHistory(UplinkHistory{FCnt: i})
+			}
+
+			Convey("Then only the last 20 items are preserved", func() {
+				So(ns.UplinkHistory, ShouldHaveLength, 20)
+				So(ns.UplinkHistory[19].FCnt, ShouldEqual, 29)
+				So(ns.UplinkHistory[0].FCnt, ShouldEqual, 10)
+			})
+		})
+
+		Convey("In case of adding the same FCnt twice", func() {
+			ns.AppendUplinkHistory(UplinkHistory{FCnt: 10, MaxSNR: 5})
+			ns.AppendUplinkHistory(UplinkHistory{FCnt: 10, MaxSNR: 6})
+
+			Convey("Then the first record is kept", func() {
+				So(ns.UplinkHistory, ShouldHaveLength, 1)
+				So(ns.UplinkHistory[0].MaxSNR, ShouldEqual, 5)
+			})
+		})
+
+		Convey("When appending 20 items, with two missing frames", func() {
+			for i := uint32(0); i < 20; i++ {
+				if i < 5 {
+					ns.AppendUplinkHistory(UplinkHistory{FCnt: i})
+					continue
+				}
+
+				if i < 10 {
+					ns.AppendUplinkHistory(UplinkHistory{FCnt: i + 1})
+					continue
+				}
+
+				ns.AppendUplinkHistory(UplinkHistory{FCnt: i + 2})
+			}
+
+			Convey("Then the packet-loss is 10%", func() {
+				So(ns.GetPacketLossPercentage(), ShouldEqual, 10)
+			})
+		})
+	})
+}
+
 func TestNodeSession(t *testing.T) {
 	conf := test.GetConfig()
 

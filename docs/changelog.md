@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.14.1
+
+**Bugfixes:**
+
+* Add mac-commands (if any) to LoRaWAN frame for Class-C transmissions.
+
+## 0.14.0
+
+**Features:**
+
+* Class C support. When a node is configured as Class-C device, downlink data
+  can be pushed to it using the `NetworkServer.PushDataDown` API method.
+
+**Changes:**
+
+* RU 864 - 869 band configuration has been updated (see [#113](https://github.com/brocaar/loraserver/issues/113))
+
+## 0.13.3
+
+**Features:**
+
+* The following band configurations have been added:
+	* AS 923
+	* CN 779 - 787
+	* EU 433
+	* KR 920 - 923
+	* RU 864 - 869
+* Flags for repeater compatibility configuration and dwell-time limitation
+  (400ms) have been added (see [configuration](configuration.md))
+
+## 0.13.2
+
+**Features:**
+
+* De-duplication delay can be configured with `--deduplication-delay` or
+  `DEDUPLICATION_DELAY` environment variable (default 200ms)
+* Get downlink data delay (delay between uplink delivery and getting the
+  downlink data from the application server) can be configured with
+  `--get-downlink-data-delay`  or `GET_DOWNLINK_DATA_DELAY` environment variable
+
+**Bugfixes:**
+
+* Fix duplicated gateway MAC in application-server and network-controller API
+  call
+
+## 0.13.1
+
+**Bugfixes:**
+
+* Fix crash when node has ADR enabled, but it is disabled in LoRa Server
+
+## 0.13.0
+
+**Features:**
+
+* Adaptive data-rate support. See [features](features.md) for information about
+  ADR. Note:
+  
+	* [LoRa App Server](https://docs.loraserver.io/lora-app-server/) 0.2.0 or
+      higher is required
+	* ADR is currently only implemented for the EU 863-870 ISM band
+	* This is an experimental feature
+
+**Fixes:**
+
+* Validate RX2 data-rate (this was causing a panic)
+
 ## 0.12.5
 
 **Security:**

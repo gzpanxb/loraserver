@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/codegangsta/cli"
@@ -38,9 +39,14 @@ func init() {
 
 var version string // set by the compiler
 var bands = []string{
+	string(band.AS_923),
 	string(band.AU_915_928),
 	string(band.CN_470_510),
+	string(band.CN_779_787),
+	string(band.EU_433),
 	string(band.EU_863_870),
+	string(band.KR_920_923),
+	string(band.RU_864_869),
 	string(band.US_902_928),
 }
 
@@ -55,11 +61,18 @@ func run(c *cli.Context) error {
 	if c.String("band") == "" {
 		log.Fatalf("--band is undefined, valid options are: %s", strings.Join(bands, ", "))
 	}
-	bandConfig, err := band.GetConfig(band.Name(c.String("band")))
+	dwellTime := lorawan.DwellTimeNoLimit
+	if c.Bool("band-dwell-time-400ms") {
+		dwellTime = lorawan.DwellTime400ms
+	}
+	bandConfig, err := band.GetConfig(band.Name(c.String("band")), c.Bool("band-repeater-compatible"), dwellTime)
 	if err != nil {
 		log.Fatal(err)
 	}
 	common.Band = bandConfig
+	common.BandName = band.Name(c.String("band"))
+	common.DeduplicationDelay = c.Duration("deduplication-delay")
+	common.GetDownlinkDataDelay = c.Duration("get-downlink-data-delay")
 
 	log.WithFields(log.Fields{
 		"version": version,
@@ -80,7 +93,7 @@ func run(c *cli.Context) error {
 	apiServer := mustGetAPIServer(lsCtx, c)
 	ln, err := net.Listen("tcp", c.String("bind"))
 	if err != nil {
-		log.Fatal("start api listener error: %s", err)
+		log.Fatalf("start api listener error: %s", err)
 	}
 	go apiServer.Serve(ln)
 
@@ -243,6 +256,16 @@ func main() {
 			Usage:  fmt.Sprintf("ism band configuration to use (options: %s)", strings.Join(bands, ", ")),
 			EnvVar: "BAND",
 		},
+		cli.BoolFlag{
+			Name:   "band-dwell-time-400ms",
+			Usage:  "band configuration takes 400ms dwell-time into account",
+			EnvVar: "BAND_DWELL_TIME_400ms",
+		},
+		cli.BoolFlag{
+			Name:   "band-repeater-compatible",
+			Usage:  "band configuration takes repeater encapsulation layer into account",
+			EnvVar: "BAND_REPEATER_COMPATIBLE",
+		},
 		cli.StringFlag{
 			Name:   "ca-cert",
 			Usage:  "ca certificate used by the api server (optional)",
@@ -326,6 +349,18 @@ func main() {
 			Name:   "nc-tls-key",
 			Usage:  "tls key used by the network-controller client (optional)",
 			EnvVar: "NC_TLS_KEY",
+		},
+		cli.DurationFlag{
+			Name:   "deduplication-delay",
+			Usage:  "time to wait for uplink de-duplication",
+			EnvVar: "DEDUPLICATION_DELAY",
+			Value:  200 * time.Millisecond,
+		},
+		cli.DurationFlag{
+			Name:   "get-downlink-data-delay",
+			Usage:  "delay between uplink delivery to the app server and getting the downlink data from the app server (if any)",
+			EnvVar: "GET_DOWNLINK_DATA_DELAY",
+			Value:  100 * time.Millisecond,
 		},
 	}
 	app.Run(os.Args)

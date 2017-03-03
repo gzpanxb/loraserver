@@ -12,8 +12,10 @@ import (
 	"github.com/brocaar/loraserver/api/as"
 	"github.com/brocaar/loraserver/api/gw"
 	"github.com/brocaar/loraserver/api/nc"
+	"github.com/brocaar/loraserver/internal/adr"
 	"github.com/brocaar/loraserver/internal/common"
 	"github.com/brocaar/loraserver/internal/downlink"
+	"github.com/brocaar/loraserver/internal/maccommand"
 	"github.com/brocaar/loraserver/internal/models"
 	"github.com/brocaar/loraserver/internal/session"
 	"github.com/brocaar/lorawan"
@@ -131,7 +133,7 @@ func handleCollectedDataUpPackets(ctx common.Context, rxPacket models.RXPacket) 
 
 	// handle FOpts mac commands (if any)
 	if len(macPL.FHDR.FOpts) > 0 {
-		if err := handleUplinkMACCommands(ctx, ns, false, macPL.FHDR.FOpts); err != nil {
+		if err := handleUplinkMACCommands(ctx, &ns, false, macPL.FHDR.FOpts); err != nil {
 			log.WithFields(log.Fields{
 				"dev_eui": ns.DevEUI,
 				"fopts":   macPL.FHDR.FOpts,
@@ -160,7 +162,7 @@ func handleCollectedDataUpPackets(ctx common.Context, rxPacket models.RXPacket) 
 				}
 				commands = append(commands, *cmd)
 			}
-			if err := handleUplinkMACCommands(ctx, ns, true, commands); err != nil {
+			if err := handleUplinkMACCommands(ctx, &ns, true, commands); err != nil {
 				log.WithFields(log.Fields{
 					"dev_eui":  ns.DevEUI,
 					"commands": commands,
@@ -173,8 +175,21 @@ func handleCollectedDataUpPackets(ctx common.Context, rxPacket models.RXPacket) 
 		}
 	}
 
+	// handle ADR (should be executed before saving the node-session)
+	if err := adr.HandleADR(ctx, &ns, rxPacket, macPL.FHDR.FCnt); err != nil {
+		log.WithFields(log.Fields{
+			"dev_eui": ns.DevEUI,
+			"fcnt_up": macPL.FHDR.FCnt,
+		}).Warningf("handle adr error: %s", err)
+	}
+
+	// update the RXInfoSet
+	ns.LastRXInfoSet = rxPacket.RXInfoSet
+
 	// sync counter with that of the device + 1
 	ns.FCntUp = macPL.FHDR.FCnt + 1
+
+	// save node-session
 	if err := session.SaveNodeSession(ctx.RedisPool, ns); err != nil {
 		return err
 	}
@@ -187,8 +202,8 @@ func handleCollectedDataUpPackets(ctx common.Context, rxPacket models.RXPacket) 
 	}
 
 	// handle downlink (ACK)
-	time.Sleep(CollectDataDownWait)
-	if err := downlink.SendDataDownResponse(ctx, ns, rxPacket); err != nil {
+	time.Sleep(common.GetDownlinkDataDelay)
+	if err := downlink.SendUplinkResponse(ctx, ns, rxPacket); err != nil {
 		return fmt.Errorf("handling downlink data for node %s failed: %s", ns.DevEUI, err)
 	}
 
@@ -219,8 +234,13 @@ func sendRXInfoPayload(ctx common.Context, ns session.NodeSession, rxPacket mode
 	}
 
 	for _, rxInfo := range rxPacket.RXInfoSet {
+		// make sure we have a copy of the MAC byte slice, else every RxInfo
+		// slice item will get the same Mac
+		mac := make([]byte, 8)
+		copy(mac, rxInfo.MAC[:])
+
 		rxInfoReq.RxInfo = append(rxInfoReq.RxInfo, &nc.RXInfo{
-			Mac:     rxInfo.MAC[:],
+			Mac:     mac,
 			Time:    rxInfo.Time.Format(time.RFC3339Nano),
 			Rssi:    int32(rxInfo.RSSI),
 			LoRaSNR: rxInfo.LoRaSNR,
@@ -256,8 +276,13 @@ func publishDataUp(ctx common.Context, ns session.NodeSession, rxPacket models.R
 	}
 
 	for _, rxInfo := range rxPacket.RXInfoSet {
+		// make sure we have a copy of the MAC byte slice, else every RxInfo
+		// slice item will get the same Mac
+		mac := make([]byte, 8)
+		copy(mac, rxInfo.MAC[:])
+
 		publishDataUpReq.RxInfo = append(publishDataUpReq.RxInfo, &as.RXInfo{
-			Mac:     rxInfo.MAC[:],
+			Mac:     mac,
 			Time:    rxInfo.Time.Format(time.RFC3339Nano),
 			Rssi:    int32(rxInfo.RSSI),
 			LoRaSNR: rxInfo.LoRaSNR,
@@ -283,7 +308,7 @@ func publishDataUp(ctx common.Context, ns session.NodeSession, rxPacket models.R
 	return nil
 }
 
-func handleUplinkMACCommands(ctx common.Context, ns session.NodeSession, frmPayload bool, commands []lorawan.MACCommand) error {
+func handleUplinkMACCommands(ctx common.Context, ns *session.NodeSession, frmPayload bool, commands []lorawan.MACCommand) error {
 	for _, cmd := range commands {
 		logFields := log.Fields{
 			"dev_eui":     ns.DevEUI,
@@ -291,21 +316,28 @@ func handleUplinkMACCommands(ctx common.Context, ns session.NodeSession, frmPayl
 			"frm_payload": frmPayload,
 		}
 
-		b, err := cmd.MarshalBinary()
-		if err != nil {
-			return fmt.Errorf("binary marshal mac command error: %s", err)
+		// proprietary MAC commands
+		if cmd.CID >= 0x80 {
+			b, err := cmd.MarshalBinary()
+			if err != nil {
+				return fmt.Errorf("binary marshal mac command error: %s", err)
+			}
+			_, err = ctx.Controller.HandleDataUpMACCommand(context.Background(), &nc.HandleDataUpMACCommandRequest{
+				AppEUI:     ns.AppEUI[:],
+				DevEUI:     ns.DevEUI[:],
+				FrmPayload: frmPayload,
+				Data:       b,
+			})
+			if err != nil {
+				log.WithFields(logFields).Errorf("send proprietary mac-command to network-controller error: %s", err)
+			} else {
+				log.WithFields(logFields).Info("proprietary mac-command sent to network-controller")
+			}
+		} else {
+			if err := maccommand.Handle(ctx, ns, cmd); err != nil {
+				log.WithFields(logFields).Errorf("handle mac-command error: %s", err)
+			}
 		}
-
-		_, err = ctx.Controller.HandleDataUpMACCommand(context.Background(), &nc.HandleDataUpMACCommandRequest{
-			AppEUI:     ns.AppEUI[:],
-			DevEUI:     ns.DevEUI[:],
-			FrmPayload: frmPayload,
-			Data:       b,
-		})
-		if err != nil {
-			return fmt.Errorf("send mac-commnad to network-controller error: %s", err)
-		}
-		log.WithFields(logFields).Info("mac-command sent to network-controller")
 	}
 	return nil
 }
