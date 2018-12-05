@@ -7,9 +7,17 @@ Vagrantfile
 # logs
 *.log
 
+# configuration
+*.toml
+
+# dependencies
+vendor/
+
 # certs
 certs/
 
-# binaries
+# builds
 dist/
 build/
+internal/migrations/
+docs/public/

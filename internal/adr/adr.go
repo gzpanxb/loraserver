@@ -3,14 +3,12 @@ package adr
 import (
 	"fmt"
 
-	log "github.com/Sirupsen/logrus"
+	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 
-	"github.com/brocaar/loraserver/internal/common"
-	"github.com/brocaar/loraserver/internal/maccommand"
-	"github.com/brocaar/loraserver/internal/models"
-	"github.com/brocaar/loraserver/internal/session"
+	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/internal/storage"
 	"github.com/brocaar/lorawan"
-	"github.com/brocaar/lorawan/band"
 )
 
 var pktLossRateTable = [][3]uint8{
@@ -20,14 +18,130 @@ var pktLossRateTable = [][3]uint8{
 	{3, 3, 3},
 }
 
-// TODO: move this to lorawan/band package in the future?
-var requiredSNRTable = []float64{
-	-20,
-	-17.5,
-	-15,
-	-12.5,
-	-10,
-	-7.5,
+// HandleADR handles ADR in case requested by the node and configured
+// in the device-session.
+func HandleADR(ds storage.DeviceSession, linkADRReqBlock *storage.MACCommandBlock) ([]storage.MACCommandBlock, error) {
+
+	// if the node has ADR disabled or it's disabled gloablly
+	if !ds.ADR || config.C.NetworkServer.NetworkSettings.DisableADR {
+		if linkADRReqBlock == nil {
+			return nil, nil
+		}
+		return []storage.MACCommandBlock{*linkADRReqBlock}, nil
+	}
+
+	// get the max SNR from the UplinkHistory
+	var snrM float64 = -999
+	var historyCount int
+	for _, uh := range ds.UplinkHistory {
+		if uh.TXPowerIndex == ds.TXPowerIndex {
+			historyCount++
+
+			if uh.MaxSNR > snrM {
+				snrM = uh.MaxSNR
+			}
+		}
+	}
+
+	if ds.DR > getMaxAllowedDR() {
+		log.WithFields(log.Fields{
+			"dr":      ds.DR,
+			"dev_eui": ds.DevEUI,
+		}).Infof("ADR is only supported up to DR%d", getMaxAllowedDR())
+		return nil, nil
+	}
+
+	dr, err := config.C.NetworkServer.Band.Band.GetDataRate(ds.DR)
+	if err != nil {
+		return nil, errors.Wrap(err, "get data-rate error")
+	}
+
+	requiredSNR, err := getRequiredSNRForSF(dr.SpreadFactor)
+	if err != nil {
+		return nil, err
+	}
+
+	snrMargin := snrM - requiredSNR - config.C.NetworkServer.NetworkSettings.InstallationMargin
+	nStep := int(snrMargin / 3)
+
+	// In case of negative steps the ADR algorithm will increase the TXPower
+	// if possible. To avoid up / down / up / down TXPower changes, wait until
+	// we have a full history table before making adjustments.
+	if nStep < 0 && historyCount != storage.UplinkHistorySize {
+		return nil, nil
+	}
+
+	maxSupportedDR := getMaxSupportedDRForNode(ds)
+	maxSupportedTXPowerOffsetIndex := getMaxSupportedTXPowerOffsetIndexForNode(ds)
+
+	idealTXPowerIndex, idealDR := getIdealTXPowerOffsetAndDR(nStep, ds.TXPowerIndex, ds.DR, ds.MinSupportedTXPowerIndex, maxSupportedTXPowerOffsetIndex, maxSupportedDR)
+	idealNbRep := getNbRep(ds.NbTrans, ds.GetPacketLossPercentage())
+
+	// there is nothing to adjust
+	if ds.TXPowerIndex == idealTXPowerIndex && ds.DR == idealDR && ds.NbTrans == idealNbRep {
+		return nil, nil
+	}
+
+	if linkADRReqBlock == nil || len(linkADRReqBlock.MACCommands) == 0 {
+		// nothing is pending
+		var chMask lorawan.ChMask
+		chMaskCntl := -1
+		for _, c := range ds.EnabledUplinkChannels {
+			if chMaskCntl != c/16 {
+				if chMaskCntl == -1 {
+					// set the chMaskCntl
+					chMaskCntl = c / 16
+				} else {
+					// break the loop as we only need to send one block of channels
+					break
+				}
+			}
+			chMask[c%16] = true
+		}
+
+		linkADRReqBlock = &storage.MACCommandBlock{
+			CID: lorawan.LinkADRReq,
+			MACCommands: []lorawan.MACCommand{
+				{
+					CID: lorawan.LinkADRReq,
+					Payload: &lorawan.LinkADRReqPayload{
+						DataRate: uint8(idealDR),
+						TXPower:  uint8(idealTXPowerIndex),
+						ChMask:   chMask,
+						Redundancy: lorawan.Redundancy{
+							ChMaskCntl: uint8(chMaskCntl),
+							NbRep:      uint8(idealNbRep),
+						},
+					},
+				},
+			},
+		}
+	} else {
+		// there is a pending block of commands in the queue, add the adr parameters
+		// to the last mac-command (as in case there are multiple commands
+		// the node will use the dr, tx power and nb-rep from the last command
+		lastMAC := linkADRReqBlock.MACCommands[len(linkADRReqBlock.MACCommands)-1]
+		lastMACPl, ok := lastMAC.Payload.(*lorawan.LinkADRReqPayload)
+		if !ok {
+			return nil, fmt.Errorf("expected *lorawan.LinkADRReqPayload, got %T", lastMAC.Payload)
+		}
+
+		lastMACPl.DataRate = uint8(idealDR)
+		lastMACPl.TXPower = uint8(idealTXPowerIndex)
+		lastMACPl.Redundancy.NbRep = uint8(idealNbRep)
+	}
+
+	log.WithFields(log.Fields{
+		"dev_eui":          ds.DevEUI,
+		"dr":               ds.DR,
+		"req_dr":           idealDR,
+		"tx_power":         ds.TXPowerIndex,
+		"req_tx_power_idx": idealTXPowerIndex,
+		"nb_trans":         ds.NbTrans,
+		"req_nb_trans":     idealNbRep,
+	}).Info("adr request added to mac-command queue")
+
+	return []storage.MACCommandBlock{*linkADRReqBlock}, nil
 }
 
 func getNbRep(currentNbRep uint8, pktLossRate float64) uint8 {
@@ -48,192 +162,95 @@ func getNbRep(currentNbRep uint8, pktLossRate float64) uint8 {
 	return pktLossRateTable[3][currentNbRep-1]
 }
 
-// HandleADR handles ADR in case requested by the node and configured
-// in the node-session.
-// Note that this function only implements ADR for the EU_863_870 band as
-// ADR for other bands is still work in progress. When implementing ADR for
-// other bands, maybe it is an idea to move ADR related constants to the
-// lorawan/band package.
-func HandleADR(ctx common.Context, ns *session.NodeSession, rxPacket models.RXPacket, fullFCnt uint32) error {
-	var maxSNR float64
-	for i, rxInfo := range rxPacket.RXInfoSet {
-		// as the default value is 0 and the LoRaSNR can be negative, we always
-		// set it when i == 0 (the first item from the slice)
-		if i == 0 || rxInfo.LoRaSNR > maxSNR {
-			maxSNR = rxInfo.LoRaSNR
-		}
-	}
-
-	// append metadata to the UplinkHistory slice.
-	ns.AppendUplinkHistory(session.UplinkHistory{
-		FCnt:         fullFCnt,
-		GatewayCount: len(rxPacket.RXInfoSet),
-		MaxSNR:       maxSNR,
-	})
-
-	macPL, ok := rxPacket.PHYPayload.MACPayload.(*lorawan.MACPayload)
-	if !ok {
-		return fmt.Errorf("expected *lorawan.MACPayload, got: %T", rxPacket.PHYPayload.MACPayload)
-	}
-
-	// if the node has ADR disabled or the uplink framecounter does not meet
-	// the configured ADR interval, there is nothing to do :-)
-	if !macPL.FHDR.FCtrl.ADR || fullFCnt == 0 || ns.ADRInterval == 0 || fullFCnt%ns.ADRInterval > 0 {
-		return nil
-	}
-
-	if common.BandName != band.EU_863_870 {
-		log.WithFields(log.Fields{
-			"dev_eui": ns.DevEUI,
-		}).Info("ADR support is only available for EU_863_870 band currently")
-		return nil
-	}
-
-	// get the max SNR from the UplinkHistory
-	var snrM float64
-	for i, uh := range ns.UplinkHistory {
-		if i == 0 || uh.MaxSNR > snrM {
-			snrM = uh.MaxSNR
-		}
-	}
-
-	currentDR, err := common.Band.GetDataRate(rxPacket.RXInfoSet[0].DataRate)
-	if err != nil {
-		return fmt.Errorf("get data-rate error: %s", err)
-	}
-
-	if currentDR > 5 {
-		log.WithFields(log.Fields{
-			"dr":      currentDR,
-			"dev_eui": ns.DevEUI,
-		}).Info("ADR is only supported up to DR5")
-		return nil
-	}
-
-	snrMargin := snrM - requiredSNRTable[currentDR] - ns.InstallationMargin
-	nStep := int(snrMargin / 3)
-
-	currentTXPower := getCurrentTXPower(ns)
-	currentTXPowerIndex := getTXPowerIndex(currentTXPower)
-	idealTXPower, idealDR := getIdealTXPowerAndDR(nStep, currentTXPower, currentDR)
-	idealTXPowerIndex := getTXPowerIndex(idealTXPower)
-	idealNbRep := getNbRep(ns.NbTrans, ns.GetPacketLossPercentage())
-
-	// there is nothing to adjust
-	if currentTXPowerIndex == idealTXPowerIndex && currentDR == idealDR {
-		return nil
-	}
-
-	var chMask lorawan.ChMask
-	for i := 0; i < len(common.Band.DownlinkChannels); i++ {
-		chMask[i] = true
-	}
-
-	for i := 0; ns.CFList != nil && i < len(ns.CFList); i++ {
-		if ns.CFList[i] == 0 {
-			continue
-		}
-		chMask[i+len(common.Band.DownlinkChannels)] = true
-	}
-
-	mac := lorawan.MACCommand{
-		CID: lorawan.LinkADRReq,
-		Payload: &lorawan.LinkADRReqPayload{
-			DataRate: uint8(idealDR),
-			TXPower:  uint8(idealTXPowerIndex),
-			ChMask:   chMask,
-			Redundancy: lorawan.Redundancy{
-				ChMaskCntl: 0, // first block of 16 channels
-				NbRep:      uint8(idealNbRep),
-			},
-		},
-	}
-	b, err := mac.MarshalBinary()
-	if err != nil {
-		return fmt.Errorf("marshal mac command error: %s", err)
-	}
-
-	err = maccommand.AddToQueue(ctx.RedisPool, maccommand.QueueItem{
-		DevEUI: ns.DevEUI,
-		Data:   b,
-	})
-	if err != nil {
-		return fmt.Errorf("add mac-payload to tx-queue error: %s", err)
-	}
-
-	err = maccommand.SetPending(ctx.RedisPool, ns.DevEUI, lorawan.LinkADRReq, []lorawan.MACCommandPayload{mac.Payload})
-	if err != nil {
-		return fmt.Errorf("set mac-payload as pending error: %s", err)
-	}
-
-	log.WithFields(log.Fields{
-		"dev_eui":      ns.DevEUI,
-		"dr":           currentDR,
-		"req_dr":       idealDR,
-		"tx_power":     currentTXPower,
-		"req_tx_power": common.Band.TXPower[idealTXPowerIndex],
-		"nb_trans":     ns.NbTrans,
-		"req_nb_trans": idealNbRep,
-	}).Info("adr request added to mac-command queue")
-
-	return nil
-}
-
-func getCurrentTXPower(ns *session.NodeSession) int {
-	if ns.TXPower > 0 {
-		return ns.TXPower
-	}
-	return common.Band.DefaultTXPower
-}
-
-func getMaxTXPower() int {
-	return common.Band.TXPower[0]
-}
-
-func getMinTXPower() int {
-	var minTX int
-	for _, p := range common.Band.TXPower {
-		// make sure we never use 0 and disable the device
-		if p > 0 {
-			minTX = p
-		}
-	}
-	return minTX
-}
-
-func getTXPowerIndex(txPower int) int {
+func getMaxTXPowerOffsetIndex() int {
 	var idx int
-	for i, p := range common.Band.TXPower {
-		if p >= txPower {
+	for i := 0; ; i++ {
+		offset, err := config.C.NetworkServer.Band.Band.GetTXPowerOffset(i)
+		if err != nil {
+			break
+		}
+		if offset != 0 {
 			idx = i
 		}
 	}
+
 	return idx
 }
 
-func getIdealTXPowerAndDR(nStep int, txPower int, dr int) (int, int) {
+func getMaxSupportedTXPowerOffsetIndexForNode(ds storage.DeviceSession) int {
+	if ds.MaxSupportedTXPowerIndex != 0 {
+		return ds.MaxSupportedTXPowerIndex
+	}
+	return getMaxTXPowerOffsetIndex()
+}
+
+func getIdealTXPowerOffsetAndDR(nStep, txPowerOffsetIndex, dr, minSupportedTXPowerOffsetIndex, maxSupportedTXPowerOffsetIndex, maxSupportedDR int) (int, int) {
 	if nStep == 0 {
-		return txPower, dr
+		return txPowerOffsetIndex, dr
 	}
 
 	if nStep > 0 {
-		if dr < 5 {
+		if dr < getMaxAllowedDR() && dr < maxSupportedDR {
+			// maxSupportedDR is the max supported DR by the node. Depending the
+			// Regional Parameters specification the node is implementing, this
+			// might not be equal to the getMaxAllowedDR value.
 			dr++
-		} else {
-			txPower -= 3
+
+		} else if txPowerOffsetIndex < getMaxTXPowerOffsetIndex() && txPowerOffsetIndex < maxSupportedTXPowerOffsetIndex {
+			// maxSupportedTXPowerOffsetIndex is the max supported TXPower
+			// index by the node. Depending the Regional Parameters
+			// specification the node is implementing, this might not be
+			// equal to the getMaxTXPowerOffsetIndex value.
+			txPowerOffsetIndex++
+
 		}
+
 		nStep--
-		if txPower <= getMinTXPower() {
-			return txPower, dr
+		if txPowerOffsetIndex >= getMaxTXPowerOffsetIndex() {
+			return getMaxTXPowerOffsetIndex(), dr
 		}
+
 	} else {
-		if txPower < getMaxTXPower() {
-			txPower += 3
+		if txPowerOffsetIndex > minSupportedTXPowerOffsetIndex {
+			txPowerOffsetIndex--
 			nStep++
-		} else {
-			return txPower, dr
+		} else if txPowerOffsetIndex <= minSupportedTXPowerOffsetIndex {
+			return minSupportedTXPowerOffsetIndex, dr
 		}
 	}
 
-	return getIdealTXPowerAndDR(nStep, txPower, dr)
+	return getIdealTXPowerOffsetAndDR(nStep, txPowerOffsetIndex, dr, minSupportedTXPowerOffsetIndex, maxSupportedTXPowerOffsetIndex, maxSupportedDR)
+}
+
+func getRequiredSNRForSF(sf int) (float64, error) {
+	snr, ok := config.SpreadFactorToRequiredSNRTable[sf]
+	if !ok {
+		return 0, fmt.Errorf("sf to required snr for does not exsists (sf: %d)", sf)
+	}
+	return snr, nil
+}
+
+func getMaxAllowedDR() int {
+	var maxDR int
+	stdChannels := config.C.NetworkServer.Band.Band.GetStandardUplinkChannelIndices()
+
+	// we take the highest data-rate from the enabled standard uplink channels
+	for _, i := range config.C.NetworkServer.Band.Band.GetEnabledUplinkChannelIndices() {
+		for _, stdI := range stdChannels {
+			if i == stdI {
+				c, _ := config.C.NetworkServer.Band.Band.GetUplinkChannel(i)
+				if c.MaxDR > maxDR {
+					maxDR = c.MaxDR
+				}
+			}
+		}
+	}
+	return maxDR
+}
+
+func getMaxSupportedDRForNode(ds storage.DeviceSession) int {
+	if ds.MaxSupportedDR != 0 {
+		return ds.MaxSupportedDR
+	}
+	return getMaxAllowedDR()
 }

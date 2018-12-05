@@ -1,66 +1,42 @@
 package maccommand
 
 import (
-	"errors"
 	"fmt"
 
-	log "github.com/Sirupsen/logrus"
-
-	"github.com/brocaar/loraserver/internal/common"
-	"github.com/brocaar/loraserver/internal/session"
+	"github.com/brocaar/loraserver/api/as"
+	"github.com/brocaar/loraserver/internal/models"
+	"github.com/brocaar/loraserver/internal/storage"
 	"github.com/brocaar/lorawan"
 )
 
 // Handle handles a MACCommand sent by a node.
-func Handle(ctx common.Context, ns *session.NodeSession, cmd lorawan.MACCommand) error {
-	var err error
-	switch cmd.CID {
+func Handle(ds *storage.DeviceSession, dp storage.DeviceProfile, sp storage.ServiceProfile, asClient as.ApplicationServerServiceClient, block storage.MACCommandBlock, pending *storage.MACCommandBlock, rxPacket models.RXPacket) ([]storage.MACCommandBlock, error) {
+	switch block.CID {
 	case lorawan.LinkADRAns:
-		err = handleLinkADRAns(ctx, ns, cmd.Payload)
+		return handleLinkADRAns(ds, block, pending)
+	case lorawan.LinkCheckReq:
+		return handleLinkCheckReq(ds, rxPacket)
+	case lorawan.DevStatusAns:
+		return handleDevStatusAns(ds, sp, asClient, block)
+	case lorawan.PingSlotInfoReq:
+		return handlePingSlotInfoReq(ds, block)
+	case lorawan.PingSlotChannelAns:
+		return handlePingSlotChannelAns(ds, block, pending)
+	case lorawan.DeviceTimeReq:
+		return handleDeviceTimeReq(ds, rxPacket)
+	case lorawan.NewChannelAns:
+		return handleNewChannelAns(ds, block, pending)
+	case lorawan.RXParamSetupAns:
+		return handleRXParamSetupAns(ds, block, pending)
+	case lorawan.RXTimingSetupAns:
+		return handleRXTimingSetupAns(ds, block, pending)
+	case lorawan.RekeyInd:
+		return handleRekeyInd(ds, block)
+	case lorawan.ResetInd:
+		return handleResetInd(ds, dp, block)
+	case lorawan.RejoinParamSetupAns:
+		return handleRejoinParamSetupAns(ds, block, pending)
 	default:
-		err = fmt.Errorf("undefined CID %d", cmd.CID)
-
+		return nil, fmt.Errorf("undefined CID %d", block.CID)
 	}
-	return err
-}
-
-// handleLinkADRAns handles the ack of an ADR request
-func handleLinkADRAns(ctx common.Context, ns *session.NodeSession, pl lorawan.MACCommandPayload) error {
-	adrAns, ok := pl.(*lorawan.LinkADRAnsPayload)
-	if !ok {
-		return fmt.Errorf("expected *lorawan.LinkADRAnsPayload, got %T", pl)
-	}
-
-	pending, err := ReadPending(ctx.RedisPool, ns.DevEUI, lorawan.LinkADRReq)
-	if err != nil {
-		return fmt.Errorf("read pending mac-commands error: %s", err)
-	}
-	if len(pending) == 0 {
-		return errors.New("no pending adr requests found")
-	}
-	adrReq, ok := pending[0].(*lorawan.LinkADRReqPayload)
-	if !ok {
-		return fmt.Errorf("expected *lorawan.LinkADRReqPayload, got %T", pending[0])
-	}
-
-	if adrAns.ChannelMaskACK && adrAns.DataRateACK && adrAns.PowerACK {
-		ns.TXPower = common.Band.TXPower[adrReq.TXPower]
-		ns.NbTrans = adrReq.Redundancy.NbRep
-
-		log.WithFields(log.Fields{
-			"dev_eui":  ns.DevEUI,
-			"tx_power": ns.TXPower,
-			"dr":       adrReq.DataRate,
-			"nb_trans": adrReq.Redundancy.NbRep,
-		}).Info("adr request acknowledged")
-	} else {
-		log.WithFields(log.Fields{
-			"dev_eui":          ns.DevEUI,
-			"channel_mask_ack": adrAns.ChannelMaskACK,
-			"data_rate_ack":    adrAns.DataRateACK,
-			"power_ack":        adrAns.PowerACK,
-		}).Warning("adr request not acknowledged")
-	}
-
-	return nil
 }

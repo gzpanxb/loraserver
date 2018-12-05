@@ -1,303 +1,225 @@
 package testsuite
 
 import (
-	"context"
-	"fmt"
 	"testing"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-
-	. "github.com/smartystreets/goconvey/convey"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 
 	"github.com/brocaar/loraserver/api/gw"
-	"github.com/brocaar/loraserver/api/ns"
-	"github.com/brocaar/loraserver/internal/api"
-	"github.com/brocaar/loraserver/internal/common"
-	"github.com/brocaar/loraserver/internal/maccommand"
-	"github.com/brocaar/loraserver/internal/session"
-	"github.com/brocaar/loraserver/internal/test"
+	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/internal/helpers"
+	"github.com/brocaar/loraserver/internal/storage"
 	"github.com/brocaar/lorawan"
 )
 
-type classCTestCase struct {
-	Name                string                        // name of the test
-	PreFunc             func(ns *session.NodeSession) // function to call before running the test
-	NodeSession         session.NodeSession           // node-session in the storage
-	PushDataDownRequest ns.PushDataDownRequest        // class-c push data-down request
-	MACCommandQueue     []maccommand.QueueItem        // downlink mac-command queue
-
-	ExpectedPushDataDownError error // expected error returned
-	ExpectedFCntUp            uint32
-	ExpectedFCntDown          uint32
-	ExpectedTXInfo            *gw.TXInfo
-	ExpectedPHYPayload        *lorawan.PHYPayload
-	ExpectedMACCommandQueue   []maccommand.QueueItem
+type ClassCTestSuite struct {
+	IntegrationTestSuite
 }
 
-func TestClassCScenarios(t *testing.T) {
-	conf := test.GetConfig()
+func (ts *ClassCTestSuite) SetupTest() {
+	ts.IntegrationTestSuite.SetupTest()
+	config.C.NetworkServer.NetworkSettings.RX2DR = 5
 
-	Convey("Given a clean state", t, func() {
-		p := common.NewRedisPool(conf.RedisURL)
-		test.MustFlushRedis(p)
+	ts.CreateDeviceProfile(storage.DeviceProfile{SupportsClassC: true})
 
-		ctx := common.Context{
-			RedisPool:   p,
-			Gateway:     test.NewGatewayBackend(),
-			Application: test.NewApplicationClient(),
-		}
+	// note that the CreateDeviceSession will automatically set
+	// the device, profiles etc.. :)
+	ds := storage.DeviceSession{
+		FCntUp:    8,
+		NFCntDown: 5,
+		UplinkGatewayHistory: map[lorawan.EUI64]storage.UplinkGatewayHistory{
+			lorawan.EUI64{1, 2, 1, 2, 1, 2, 1, 2}: storage.UplinkGatewayHistory{},
+		},
+		EnabledUplinkChannels: []int{0, 1, 2},
+		RX2DR:                 5,
+		RX2Frequency:          869525000,
 
-		api := api.NewNetworkServerAPI(ctx)
+		DevAddr:     lorawan.DevAddr{1, 2, 3, 4},
+		FNwkSIntKey: lorawan.AES128Key{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SNwkSIntKey: lorawan.AES128Key{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		NwkSEncKey:  lorawan.AES128Key{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+	}
+	ts.CreateDeviceSession(ds)
+}
 
-		sess := session.NodeSession{
-			DevAddr:  lorawan.DevAddr{1, 2, 3, 4},
-			DevEUI:   lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
-			AppEUI:   lorawan.EUI64{8, 7, 6, 5, 4, 3, 2, 1},
-			NwkSKey:  lorawan.AES128Key{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
-			FCntUp:   8,
-			FCntDown: 5,
-			LastRXInfoSet: []gw.RXInfo{
-				{MAC: lorawan.EUI64{1, 2, 1, 2, 1, 2, 1, 2}},
-				{MAC: lorawan.EUI64{2, 1, 2, 1, 2, 1, 2, 1}},
+func (ts *ClassCTestSuite) TestClassC() {
+	assert := require.New(ts.T())
+	defaults := config.C.NetworkServer.Band.Band.GetDefaults()
+
+	txInfo := gw.DownlinkTXInfo{
+		GatewayId:   []byte{1, 2, 1, 2, 1, 2, 1, 2},
+		Immediately: true,
+		Frequency:   uint32(defaults.RX2Frequency),
+		Power:       int32(config.C.NetworkServer.Band.Band.GetDownlinkTXPower(defaults.RX2Frequency)),
+	}
+	assert.NoError(helpers.SetDownlinkTXInfoDataRate(&txInfo, 5, config.C.NetworkServer.Band.Band))
+
+	fPortTen := uint8(10)
+
+	tests := []DownlinkTest{
+		{
+			Name:          "unconfirmed data",
+			DeviceSession: *ts.DeviceSession,
+			DeviceQueueItems: []storage.DeviceQueueItem{
+				{DevEUI: ts.DeviceSession.DevEUI, FPort: 10, FCnt: 5, FRMPayload: make([]byte, 242)},
 			},
-			RX2DR: 1,
-		}
-
-		txInfo := gw.TXInfo{
-			MAC:         lorawan.EUI64{1, 2, 1, 2, 1, 2, 1, 2},
-			Immediately: true,
-			Frequency:   common.Band.RX2Frequency,
-			Power:       common.Band.DefaultTXPower,
-			DataRate:    common.Band.DataRates[sess.RX2DR],
-			CodeRate:    "4/5",
-		}
-
-		fPortTen := uint8(10)
-
-		Convey("Given a set of test-scenarios for Class-C", func() {
-			tests := []classCTestCase{
-				{
-					Name:        "unconfirmed data",
-					NodeSession: sess,
-					PushDataDownRequest: ns.PushDataDownRequest{
-						DevEUI:    []byte{1, 2, 3, 4, 5, 6, 7, 8},
-						Data:      []byte{5, 4, 3, 2, 1},
-						Confirmed: false,
-						FPort:     10,
-						FCnt:      5,
+			Assert: []Assertion{
+				AssertFCntUp(8),
+				AssertNFCntDown(6),
+				AssertDownlinkFrame(txInfo, lorawan.PHYPayload{
+					MHDR: lorawan.MHDR{
+						MType: lorawan.UnconfirmedDataDown,
+						Major: lorawan.LoRaWANR1,
 					},
-
-					ExpectedFCntUp:   8,
-					ExpectedFCntDown: 6,
-					ExpectedTXInfo:   &txInfo,
-					ExpectedPHYPayload: &lorawan.PHYPayload{
-						MHDR: lorawan.MHDR{
-							MType: lorawan.UnconfirmedDataDown,
-							Major: lorawan.LoRaWANR1,
-						},
-						MACPayload: &lorawan.MACPayload{
-							FHDR: lorawan.FHDR{
-								DevAddr: sess.DevAddr,
-								FCnt:    5,
-								FCtrl:   lorawan.FCtrl{},
-							},
-							FPort: &fPortTen,
-							FRMPayload: []lorawan.Payload{
-								&lorawan.DataPayload{Bytes: []byte{5, 4, 3, 2, 1}},
+					MIC: lorawan.MIC{155, 150, 40, 188},
+					MACPayload: &lorawan.MACPayload{
+						FHDR: lorawan.FHDR{
+							DevAddr: ts.DeviceSession.DevAddr,
+							FCnt:    5,
+							FCtrl: lorawan.FCtrl{
+								ADR: true,
 							},
 						},
-					},
-				},
-				{
-					Name:        "confirmed data",
-					NodeSession: sess,
-					PushDataDownRequest: ns.PushDataDownRequest{
-						DevEUI:    []byte{1, 2, 3, 4, 5, 6, 7, 8},
-						Data:      []byte{5, 4, 3, 2, 1},
-						Confirmed: true,
-						FPort:     10,
-						FCnt:      5,
-					},
-
-					ExpectedFCntUp:   8,
-					ExpectedFCntDown: 5,
-					ExpectedTXInfo:   &txInfo,
-					ExpectedPHYPayload: &lorawan.PHYPayload{
-						MHDR: lorawan.MHDR{
-							MType: lorawan.ConfirmedDataDown,
-							Major: lorawan.LoRaWANR1,
-						},
-						MACPayload: &lorawan.MACPayload{
-							FHDR: lorawan.FHDR{
-								DevAddr: sess.DevAddr,
-								FCnt:    5,
-								FCtrl:   lorawan.FCtrl{},
-							},
-							FPort: &fPortTen,
-							FRMPayload: []lorawan.Payload{
-								&lorawan.DataPayload{Bytes: []byte{5, 4, 3, 2, 1}},
-							},
+						FPort: &fPortTen,
+						FRMPayload: []lorawan.Payload{
+							&lorawan.DataPayload{Bytes: make([]byte, 242)},
 						},
 					},
-				},
-				{
-					Name:        "mac-commands in the queue",
-					NodeSession: sess,
-					MACCommandQueue: []maccommand.QueueItem{
-						{DevEUI: sess.DevEUI, Data: []byte{6}},
-						{DevEUI: sess.DevEUI, Data: []byte{8, 3}},
+				}),
+			},
+		},
+		{
+			Name:          "unconfirmed data (only first item is emitted because of class-c downlink lock)",
+			DeviceSession: *ts.DeviceSession,
+			DeviceQueueItems: []storage.DeviceQueueItem{
+				{DevEUI: ts.DeviceSession.DevEUI, FPort: 10, FCnt: 5, FRMPayload: make([]byte, 242)},
+				{DevEUI: ts.DeviceSession.DevEUI, FPort: 10, FCnt: 6, FRMPayload: make([]byte, 242)},
+			},
+			Assert: []Assertion{
+				AssertFCntUp(8),
+				AssertNFCntDown(6),
+				AssertDownlinkFrame(txInfo, lorawan.PHYPayload{
+					MHDR: lorawan.MHDR{
+						MType: lorawan.UnconfirmedDataDown,
+						Major: lorawan.LoRaWANR1,
 					},
-					PushDataDownRequest: ns.PushDataDownRequest{
-						DevEUI: []byte{1, 2, 3, 4, 5, 6, 7, 8},
-						Data:   []byte{5, 4, 3, 2, 1},
-						FPort:  10,
-						FCnt:   5,
-					},
-					ExpectedFCntUp:   8,
-					ExpectedFCntDown: 6,
-					ExpectedTXInfo:   &txInfo,
-					ExpectedPHYPayload: &lorawan.PHYPayload{
-						MHDR: lorawan.MHDR{
-							MType: lorawan.UnconfirmedDataDown,
-							Major: lorawan.LoRaWANR1,
-						},
-						MACPayload: &lorawan.MACPayload{
-							FHDR: lorawan.FHDR{
-								DevAddr: sess.DevAddr,
-								FCnt:    5,
-								FCtrl:   lorawan.FCtrl{},
-								FOpts: []lorawan.MACCommand{
-									{CID: lorawan.CID(6)},
-									{CID: lorawan.CID(8), Payload: &lorawan.RXTimingSetupReqPayload{Delay: 3}},
-								},
-							},
-							FPort: &fPortTen,
-							FRMPayload: []lorawan.Payload{
-								&lorawan.DataPayload{Bytes: []byte{5, 4, 3, 2, 1}},
+					MIC: lorawan.MIC{166, 225, 232, 165},
+					MACPayload: &lorawan.MACPayload{
+						FHDR: lorawan.FHDR{
+							DevAddr: ts.DeviceSession.DevAddr,
+							FCnt:    5,
+							FCtrl: lorawan.FCtrl{
+								ADR:      true,
+								FPending: true,
+								ClassB:   true, // shares the same bit as FPending
 							},
 						},
+						FPort: &fPortTen,
+						FRMPayload: []lorawan.Payload{
+							&lorawan.DataPayload{Bytes: make([]byte, 242)},
+						},
 					},
-				},
-				// errors
-				{
-					Name:        "maximum payload exceeded",
-					NodeSession: sess,
-					PushDataDownRequest: ns.PushDataDownRequest{
-						DevEUI:    []byte{1, 2, 3, 4, 5, 6, 7, 8},
-						Data:      make([]byte, 300),
-						Confirmed: false,
-						FPort:     10,
-						FCnt:      5,
+				}),
+			},
+		},
+		{
+			Name:          "confirmed data",
+			DeviceSession: *ts.DeviceSession,
+			DeviceQueueItems: []storage.DeviceQueueItem{
+				{DevEUI: ts.DeviceSession.DevEUI, FPort: 10, FCnt: 5, Confirmed: true, FRMPayload: []byte{5, 4, 3, 2, 1}},
+			},
+			Assert: []Assertion{
+				AssertFCntUp(8),
+				AssertNFCntDown(6),
+				AssertDownlinkFrame(txInfo, lorawan.PHYPayload{
+					MHDR: lorawan.MHDR{
+						MType: lorawan.ConfirmedDataDown,
+						Major: lorawan.LoRaWANR1,
 					},
-
-					ExpectedPushDataDownError: grpc.Errorf(codes.InvalidArgument, "maximum payload size exceeded"),
-					ExpectedFCntUp:            8,
-					ExpectedFCntDown:          5,
-				},
-				{
-					Name:        "invalid FPort",
-					NodeSession: sess,
-					PushDataDownRequest: ns.PushDataDownRequest{
-						DevEUI:    []byte{1, 2, 3, 4, 5, 6, 7, 8},
-						Data:      []byte{1, 2, 3, 4, 5},
-						Confirmed: false,
-						FPort:     0,
-						FCnt:      5,
+					MIC: lorawan.MIC{212, 125, 174, 208},
+					MACPayload: &lorawan.MACPayload{
+						FHDR: lorawan.FHDR{
+							DevAddr: ts.DeviceSession.DevAddr,
+							FCnt:    5,
+							FCtrl: lorawan.FCtrl{
+								ADR: true,
+							},
+						},
+						FPort: &fPortTen,
+						FRMPayload: []lorawan.Payload{
+							&lorawan.DataPayload{Bytes: []byte{5, 4, 3, 2, 1}},
+						},
 					},
-					ExpectedPushDataDownError: grpc.Errorf(codes.InvalidArgument, "FPort must not be 0"),
-					ExpectedFCntUp:            8,
-					ExpectedFCntDown:          5,
-				},
-				{
-					Name:        "invalid DevEUI",
-					NodeSession: sess,
-					PushDataDownRequest: ns.PushDataDownRequest{
-						DevEUI:    []byte{1, 1, 1, 1, 1, 1, 1, 1, 1},
-						Data:      []byte{1, 2, 3, 4, 5},
-						Confirmed: false,
-						FPort:     10,
-						FCnt:      5,
+				}),
+			},
+		},
+		{
+			Name:          "queue item discarded (max payload exceeded)",
+			DeviceSession: *ts.DeviceSession,
+			DeviceQueueItems: []storage.DeviceQueueItem{
+				{DevEUI: ts.DeviceSession.DevEUI, FPort: 10, FCnt: 10, FRMPayload: make([]byte, 300)},
+			},
+			Assert: []Assertion{
+				AssertFCntUp(8),
+				AssertNFCntDown(5),
+				AssertNoDownlinkFrame,
+			},
+		},
+		{
+			Name: "containing mac-commands",
+			BeforeFunc: func(*DownlinkTest) error {
+				ts.ServiceProfile.DevStatusReqFreq = 1
+				if err := storage.UpdateServiceProfile(config.C.PostgreSQL.DB, ts.ServiceProfile); err != nil {
+					return err
+				}
+				if err := storage.FlushServiceProfileCache(config.C.Redis.Pool, ts.ServiceProfile.ID); err != nil {
+					return err
+				}
+
+				return nil
+			},
+			DeviceSession: *ts.DeviceSession,
+			DeviceQueueItems: []storage.DeviceQueueItem{
+				{DevEUI: ts.DeviceSession.DevEUI, FPort: 10, FCnt: 5, FRMPayload: []byte{5, 4, 3, 2, 1}},
+			},
+			Assert: []Assertion{
+				AssertFCntUp(8),
+				AssertNFCntDown(6),
+				AssertDownlinkFrame(txInfo, lorawan.PHYPayload{
+					MHDR: lorawan.MHDR{
+						MType: lorawan.UnconfirmedDataDown,
+						Major: lorawan.LoRaWANR1,
 					},
-					ExpectedPushDataDownError: grpc.Errorf(codes.Unknown, "get node-session pointer for node 0101010101010101 error: redigo: nil returned"),
-					ExpectedFCntUp:            8,
-					ExpectedFCntDown:          5,
-				},
-				{
-					Name:        "no last RXInfoSet available",
-					NodeSession: sess,
-					PreFunc: func(ns *session.NodeSession) {
-						ns.LastRXInfoSet = []gw.RXInfo{}
+					MIC: lorawan.MIC{115, 18, 33, 93},
+					MACPayload: &lorawan.MACPayload{
+						FHDR: lorawan.FHDR{
+							DevAddr: ts.DeviceSession.DevAddr,
+							FCnt:    5,
+							FCtrl: lorawan.FCtrl{
+								ADR: true,
+							},
+							FOpts: []lorawan.Payload{
+								&lorawan.MACCommand{CID: lorawan.CID(6)},
+							},
+						},
+						FPort: &fPortTen,
+						FRMPayload: []lorawan.Payload{
+							&lorawan.DataPayload{Bytes: []byte{5, 4, 3, 2, 1}},
+						},
 					},
-					PushDataDownRequest: ns.PushDataDownRequest{
-						DevEUI:    []byte{1, 2, 3, 4, 5, 6, 7, 8},
-						Data:      []byte{1, 2, 3, 4, 5},
-						Confirmed: false,
-						FPort:     10,
-						FCnt:      5,
-					},
-					ExpectedPushDataDownError: grpc.Errorf(codes.FailedPrecondition, "no last RX-Info set available"),
-					ExpectedFCntUp:            8,
-					ExpectedFCntDown:          5,
-				},
-				{
-					Name:        "given FCnt does not match the FCntDown",
-					NodeSession: sess,
-					PushDataDownRequest: ns.PushDataDownRequest{
-						DevEUI:    []byte{1, 2, 3, 4, 5, 6, 7, 8},
-						Data:      []byte{1, 2, 3, 4, 5},
-						Confirmed: false,
-						FPort:     10,
-						FCnt:      6,
-					},
-					ExpectedPushDataDownError: grpc.Errorf(codes.InvalidArgument, "invalid FCnt (expected: 5)"),
-					ExpectedFCntUp:            8,
-					ExpectedFCntDown:          5,
-				},
-			}
+				}),
+			},
+		},
+	}
 
-			for i, t := range tests {
-				Convey(fmt.Sprintf("When testing: %s [%d]", t.Name, i), func() {
-					if t.PreFunc != nil {
-						t.PreFunc(&t.NodeSession)
-					}
-
-					// create node-session
-					So(session.CreateNodeSession(ctx.RedisPool, t.NodeSession), ShouldBeNil)
-
-					// mac mac-command queue items
-					for _, qi := range t.MACCommandQueue {
-						So(maccommand.AddToQueue(ctx.RedisPool, qi), ShouldBeNil)
-					}
-
-					// push the data
-					_, err := api.PushDataDown(context.Background(), &t.PushDataDownRequest)
-					So(err, ShouldResemble, t.ExpectedPushDataDownError)
-
-					Convey("Then the frame-counters are as expected", func() {
-						sess, err := session.GetNodeSessionByDevEUI(ctx.RedisPool, t.NodeSession.DevEUI)
-						So(err, ShouldBeNil)
-						So(sess.FCntUp, ShouldEqual, t.ExpectedFCntUp)
-						So(sess.FCntDown, ShouldEqual, t.ExpectedFCntDown)
-					})
-
-					if t.ExpectedTXInfo != nil && t.ExpectedPHYPayload != nil {
-						Convey("Then the expected frame was sent", func() {
-							So(ctx.Gateway.(*test.GatewayBackend).TXPacketChan, ShouldHaveLength, 1)
-							txPacket := <-ctx.Gateway.(*test.GatewayBackend).TXPacketChan
-							So(&txPacket.TXInfo, ShouldResemble, t.ExpectedTXInfo)
-						})
-					} else {
-						So(ctx.Gateway.(*test.GatewayBackend).TXPacketChan, ShouldHaveLength, 0)
-					}
-
-					Convey("Then the mac-command queue contains the expected items", func() {
-						items, err := maccommand.ReadQueue(ctx.RedisPool, t.NodeSession.DevAddr)
-						So(err, ShouldBeNil)
-						So(items, ShouldResemble, t.ExpectedMACCommandQueue)
-					})
-				})
-			}
+	for _, tst := range tests {
+		ts.T().Run(tst.Name, func(t *testing.T) {
+			ts.AssertDownlinkTest(t, tst)
 		})
-	})
+	}
+}
+
+func TestClassC(t *testing.T) {
+	suite.Run(t, new(ClassCTestSuite))
 }
