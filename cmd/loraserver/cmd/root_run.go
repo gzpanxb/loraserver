@@ -10,11 +10,10 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
-	"github.com/grpc-ecosystem/go-grpc-middleware"
-	"github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus"
-	"github.com/grpc-ecosystem/go-grpc-middleware/tags"
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	grpc_logrus "github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus"
+	grpc_ctxtags "github.com/grpc-ecosystem/go-grpc-middleware/tags"
 	"github.com/pkg/errors"
 	migrate "github.com/rubenv/sql-migrate"
 	log "github.com/sirupsen/logrus"
@@ -52,8 +51,7 @@ func run(cmd *cobra.Command, args []string) error {
 		setLogLevel,
 		setBandConfig,
 		setRXParameters,
-		setStatsAggregationIntervals,
-		setTimezone,
+		setupMetrics,
 		printStartMessage,
 		enableUplinkChannels,
 		setRedisPool,
@@ -65,6 +63,7 @@ func run(cmd *cobra.Command, args []string) error {
 		setNetworkController,
 		runDatabaseMigrations,
 		fixV2RedisCache,
+		migrateGatewayStats,
 		startAPIServer,
 		startLoRaServer(server),
 		startStatsServer(gwStats),
@@ -137,21 +136,35 @@ func setRXParameters() error {
 	return nil
 }
 
-func setStatsAggregationIntervals() error {
-	// get the gw stats aggregation intervals
-	storage.MustSetStatsAggregationIntervals(config.C.NetworkServer.Gateway.Stats.AggregationIntervals)
-	return nil
-}
-
-func setTimezone() error {
-	// get the timezone
-	if config.C.NetworkServer.Gateway.Stats.Timezone != "" {
-		l, err := time.LoadLocation(config.C.NetworkServer.Gateway.Stats.Timezone)
-		if err != nil {
-			return errors.Wrap(err, "load timezone location error")
-		}
-		config.C.NetworkServer.Gateway.Stats.TimezoneLocation = l
+func setupMetrics() error {
+	// setup aggregation intervals
+	var intervals []storage.AggregationInterval
+	for _, agg := range config.C.Metrics.Redis.AggregationIntervals {
+		intervals = append(intervals, storage.AggregationInterval(strings.ToUpper(agg)))
 	}
+	if err := storage.SetAggregationIntervals(intervals); err != nil {
+		return errors.Wrap(err, "set aggregation intervals error")
+	}
+
+	// setup timezone
+	var err error
+	if config.C.Metrics.Timezone == "" {
+		err = storage.SetTimeLocation(config.C.NetworkServer.Gateway.Stats.Timezone)
+	} else {
+		err = storage.SetTimeLocation(config.C.Metrics.Timezone)
+	}
+	if err != nil {
+		return errors.Wrap(err, "set time location error")
+	}
+
+	// setup storage TTL
+	storage.SetMetricsTTL(
+		config.C.Metrics.Redis.MinuteAggregationTTL,
+		config.C.Metrics.Redis.HourAggregationTTL,
+		config.C.Metrics.Redis.DayAggregationTTL,
+		config.C.Metrics.Redis.MonthAggregationTTL,
+	)
+
 	return nil
 }
 
@@ -165,7 +178,7 @@ func printStartMessage() error {
 		"version": version,
 		"net_id":  config.C.NetworkServer.NetID.String(),
 		"band":    config.C.NetworkServer.Band.Name,
-		"docs":    "https://docs.loraserver.io/",
+		"docs":    "https:/www.loraserver.io/",
 	}).Info("starting LoRa Server")
 	return nil
 }
@@ -437,5 +450,11 @@ func mustGetTransportCredentials(tlsCert, tlsKey, caCert string, verifyClientCer
 func fixV2RedisCache() error {
 	return code.Migrate(config.C.PostgreSQL.DB, "v1_to_v2_flush_profiles_cache", func() error {
 		return code.FlushProfilesCache(config.C.Redis.Pool, config.C.PostgreSQL.DB)
+	})
+}
+
+func migrateGatewayStats() error {
+	return code.Migrate(config.C.PostgreSQL.DB, "migrate_gateway_stats_to_redis", func() error {
+		return code.MigrateGatewayStats(config.C.Redis.Pool, config.C.PostgreSQL.DB)
 	})
 }
